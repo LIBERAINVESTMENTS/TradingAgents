@@ -23,7 +23,7 @@ from pathlib import Path
 
 import requests
 
-from tradingagents.dataflows.files import locked
+from tradingagents.dataflows.files import locked, replace_file_durably
 from tradingagents.default_config import _TRADINGAGENTS_HOME
 
 ISSUER = "https://auth.openai.com"
@@ -71,15 +71,13 @@ def _write(data: dict) -> None:
     """Write the auth file whole, readable only by its owner. Unlike a cache, a failed
     write must surface: losing a rotated refresh token would end the sign-in."""
     AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temp = AUTH_FILE.with_name(f"{AUTH_FILE.name}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
+
+    def write(temp):
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
-        os.replace(temp, AUTH_FILE)
-    except BaseException:
-        temp.unlink(missing_ok=True)
-        raise
+
+    replace_file_durably(AUTH_FILE, write)
 
 
 def _host_id(data: dict) -> str:

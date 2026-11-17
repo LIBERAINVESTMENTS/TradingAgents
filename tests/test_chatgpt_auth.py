@@ -113,6 +113,58 @@ def _renewal(data):
             "id_token": _id_token(), "scope": auth.SCOPE}
 
 
+@pytest.mark.unit
+def test_a_temporary_auth_file_access_denial_is_retried(home, monkeypatch):
+    """A Windows reader briefly holding the auth file must not end the sign-in."""
+    from pathlib import Path
+
+    _signed_in(expires_at=time.time() + 3000)
+    original_replace = os.replace
+    attempts = {"count": 0}
+
+    def fail_once_then_replace(source, destination):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise PermissionError(13, "Auth file is temporarily in use")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_once_then_replace)
+    monkeypatch.setattr(Path, "replace", fail_once_then_replace)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    auth._write({"host_id": "updated"})
+
+    assert attempts["count"] == 2
+    assert json.loads(auth.AUTH_FILE.read_text(encoding="utf-8")) == {"host_id": "updated"}
+    assert list(auth.AUTH_FILE.parent.glob("*.tmp")) == []
+
+
+@pytest.mark.unit
+def test_a_permanent_auth_file_access_denial_is_loud_and_preserves_tokens(home, monkeypatch):
+    """A failed credential update keeps the old token and surfaces the error."""
+    from pathlib import Path
+
+    _signed_in(expires_at=time.time() + 3000)
+    original_text = auth.AUTH_FILE.read_text(encoding="utf-8")
+    attempts = {"count": 0}
+
+    def deny_replace(source, destination):
+        attempts["count"] += 1
+        raise PermissionError(13, "Auth file remains in use")
+
+    monkeypatch.setattr(os, "replace", deny_replace)
+    monkeypatch.setattr(Path, "replace", deny_replace)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    with pytest.raises(PermissionError, match="Auth file remains in use"):
+        auth._write({"host_id": "updated"})
+
+    assert 2 <= attempts["count"] <= 10
+    assert auth.AUTH_FILE.read_text(encoding="utf-8") == original_text
+    assert json.loads(original_text)["tokens"]["refresh_token"] == "r1"
+    assert list(auth.AUTH_FILE.parent.glob("*.tmp")) == []
+
+
 # --- the ID token ----------------------------------------------------------------
 
 @pytest.mark.unit

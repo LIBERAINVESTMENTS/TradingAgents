@@ -469,18 +469,100 @@ class TestDeferredReflection:
         assert aapl["reflection"] == "Neutral result."
         assert msft["ticker"] == "MSFT" and msft["pending"] is True
 
-    def test_update_atomic_write(self, tmp_path):
-        """A pre-existing .tmp file is overwritten; the log is correctly updated."""
+    def test_update_atomic_write_does_not_touch_an_unrelated_temp_file(self, tmp_path):
+        """Each write owns a unique temp file instead of consuming a fixed shared path."""
         log = make_log(tmp_path)
         log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
         stale_tmp = tmp_path / "trading_memory.tmp"
-        stale_tmp.write_text("GARBAGE CONTENT — should be overwritten", encoding="utf-8")
+        stale_tmp.write_text("Unrelated content — must be preserved", encoding="utf-8")
+
         log.update_with_outcome("NVDA", "2026-01-10", 0.042, 0.021, 5, "Correct.")
-        assert not stale_tmp.exists()
+
+        assert stale_tmp.read_text(encoding="utf-8") == "Unrelated content — must be preserved"
         entries = log.load_entries()
         assert len(entries) == 1
         assert entries[0]["reflection"] == "Correct."
         assert entries[0]["pending"] is False
+
+    @pytest.mark.parametrize("method", ["single", "batch"])
+    def test_update_retries_a_transient_replace_access_denial(
+        self, tmp_path, monkeypatch, method
+    ):
+        """A Windows reader briefly holding the destination must not lose an outcome."""
+        from pathlib import Path
+
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        log.store_decision("AAPL", "2026-01-11", DECISION_SELL)
+        updates = [
+            {"ticker": "NVDA", "trade_date": "2026-01-10", "raw_return": 0.04,
+             "alpha_return": 0.02, "holding_days": 5, "reflection": "NVDA settled."},
+            {"ticker": "AAPL", "trade_date": "2026-01-11", "raw_return": -0.01,
+             "alpha_return": -0.02, "holding_days": 5, "reflection": "AAPL settled."},
+        ]
+        original_replace = Path.replace
+        attempts = {"count": 0}
+
+        def fail_once_then_replace(source, destination):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise PermissionError(13, "Destination is temporarily in use")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(Path, "replace", fail_once_then_replace)
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        if method == "single":
+            assert log.update_with_outcome(**updates[0]) is True
+        else:
+            log.batch_update_with_outcomes(updates)
+
+        entries = log.load_entries()
+        assert attempts["count"] == 2
+        assert len(entries) == 2
+        assert entries[0]["reflection"] == "NVDA settled."
+        assert entries[1]["reflection"] == (
+            "AAPL settled." if method == "batch" else ""
+        )
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    @pytest.mark.parametrize("method", ["single", "batch"])
+    def test_update_reports_permanent_replace_failure_without_losing_entries(
+        self, tmp_path, monkeypatch, method
+    ):
+        """Retries are bounded, cleanup happens, and a failed update stays pending and loud."""
+        from pathlib import Path
+
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        log.store_decision("AAPL", "2026-01-11", DECISION_SELL)
+        original_text = (tmp_path / "trading_memory.md").read_text(encoding="utf-8")
+        updates = [
+            {"ticker": "NVDA", "trade_date": "2026-01-10", "raw_return": 0.04,
+             "alpha_return": 0.02, "holding_days": 5, "reflection": "NVDA settled."},
+            {"ticker": "AAPL", "trade_date": "2026-01-11", "raw_return": -0.01,
+             "alpha_return": -0.02, "holding_days": 5, "reflection": "AAPL settled."},
+        ]
+        attempts = {"count": 0}
+
+        def deny_replace(source, destination):
+            attempts["count"] += 1
+            raise PermissionError(13, "Destination remains in use")
+
+        monkeypatch.setattr(Path, "replace", deny_replace)
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        with pytest.raises(PermissionError, match="Destination remains in use"):
+            if method == "single":
+                log.update_with_outcome(**updates[0])
+            else:
+                log.batch_update_with_outcomes(updates)
+
+        assert 2 <= attempts["count"] <= 10
+        assert (tmp_path / "trading_memory.md").read_text(encoding="utf-8") == original_text
+        assert len(log.load_entries()) == 2
+        assert all(entry["pending"] for entry in log.load_entries())
+        assert list(tmp_path.glob("*.tmp")) == []
 
     def test_update_noop_when_no_log_path(self):
         log = TradingMemoryLog(config=None)

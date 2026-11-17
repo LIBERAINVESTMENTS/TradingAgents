@@ -5,7 +5,14 @@ import re
 from pathlib import Path
 
 from tradingagents.agents.rating import parse_rating
-from tradingagents.dataflows.files import locked
+from tradingagents.dataflows.files import locked, replace_file_durably
+
+
+def _replace_atomically(path: Path, text: str) -> None:
+    """Write a memory log whole, retrying transient Windows access denials."""
+    replace_file_durably(
+        path, lambda temp: Path(temp).write_text(text, encoding="utf-8")
+    )
 
 
 class TradingMemoryLog:
@@ -198,9 +205,7 @@ class TradingMemoryLog:
 
             new_blocks = self._apply_rotation(new_blocks)
             new_text = self._SEPARATOR.join(new_blocks)
-            tmp_path = self._log_path.with_suffix(".tmp")
-            tmp_path.write_text(new_text, encoding="utf-8")
-            tmp_path.replace(self._log_path)
+            _replace_atomically(self._log_path, new_text)
             return True
 
     def batch_update_with_outcomes(self, updates: list[dict]) -> None:
@@ -252,9 +257,7 @@ class TradingMemoryLog:
 
             new_blocks = self._apply_rotation(new_blocks)
             new_text = self._SEPARATOR.join(new_blocks)
-            tmp_path = self._log_path.with_suffix(".tmp")
-            tmp_path.write_text(new_text, encoding="utf-8")
-            tmp_path.replace(self._log_path)
+            _replace_atomically(self._log_path, new_text)
 
     # --- Helpers ---
 
