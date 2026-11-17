@@ -3,6 +3,7 @@
 import errno
 import logging
 import os
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -31,6 +32,33 @@ def replace_file(path, write: Callable[[str], None]) -> None:
     except BaseException:
         temp.unlink(missing_ok=True)
         raise
+
+
+_REPLACE_ATTEMPTS = 5
+_REPLACE_RETRY_DELAY = 0.05
+
+
+def replace_file_durably(path, write: Callable[[str], None]) -> None:
+    """Replace a non-cache file, never hiding an unsuccessful update.
+
+    Each writer owns its temp file. Windows can deny replacement while another
+    thread briefly holds the destination open for reading, so retry that error
+    with a bounded backoff; after the final attempt, propagate it to the caller.
+    """
+    path = Path(path)
+    temp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        write(str(temp))
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                temp.replace(path)
+                return
+            except PermissionError:
+                if attempt == _REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_REPLACE_RETRY_DELAY * (2**attempt))
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 @contextmanager
